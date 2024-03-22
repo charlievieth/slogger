@@ -258,13 +258,21 @@ func (self *RollingFileAppender) Close() error {
 }
 
 func (self *RollingFileAppender) Flush() error {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if err := self.file.Sync(); err != nil {
-		return &SyncError{self.absPath, err}
-	}
-
+	// NB(charlie): This method used to call os.File.Sync (fsync) which is
+	// extremely expensive and really not necessary for logs. Depending on
+	// the filesystem and underlying storage medium this can decrease write
+	// IOPs to the 10s or low 100s (on a M1 macOS calling fsync after each
+	// write decreases write IOPs by a factor of 3100x).
+	//
+	// Calling fsync will also put additional pressure on the underlying storage
+	// system which may adversely impact other programs running on the system
+	// (e.g. a database).
+	//
+	// Additionally, some Appenders like AsyncAppender call this method after
+	// each call to Append so this is often a very hot function.
+	//
+	// TODO(charlie): If at some point we wanted to sync the file to disk we
+	// should only do so periodically.
 	return nil
 }
 
