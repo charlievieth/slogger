@@ -20,10 +20,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 func TestLevels(test *testing.T) {
@@ -394,4 +396,20 @@ type customError struct{}
 
 func (e customError) Error() string {
 	return "foo"
+}
+
+func TestIgnoreThisFilenameToo(t *testing.T) {
+	orig := getIgnoredFileNames()
+	t.Cleanup(func() {
+		ignoredFileNames = unsafe.Pointer(&orig)
+	})
+	want := append([]string(nil), orig...)
+	for r := 'a'; r <= 'z'; r++ {
+		want = append(want, string(r))
+		IgnoreThisFilenameToo(string(r))
+		got := getIgnoredFileNames()
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("getIgnoredFileNames() = %q; want: %q", got, want)
+		}
+	}
 }

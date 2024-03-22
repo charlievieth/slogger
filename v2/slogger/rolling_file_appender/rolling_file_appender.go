@@ -221,10 +221,11 @@ func NewWithStringWriter(filename string, maxFileSize int64, maxDuration time.Du
 }
 
 func (self *RollingFileAppender) Append(log *slogger.Log) error {
+	msg := slogger.GetFormatLogFunc()(log)
+
 	self.lock.Lock()
 	defer self.lock.Unlock()
-
-	n, err := self.appendSansSizeTracking(log)
+	n, err := self.stringWriterCallback(self.file).WriteString(msg)
 	self.curFileSize += int64(n)
 
 	if err != nil {

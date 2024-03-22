@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sync/atomic"
+	"unsafe"
 )
 
 type Appender interface {
@@ -25,19 +27,18 @@ type Appender interface {
 	Flush() error
 }
 
-var formatLogFunc = FormatLog
+type formatVal struct {
+	format func(log *Log) string
+}
+
+var formatFn unsafe.Pointer = unsafe.Pointer(&formatVal{format: FormatLog})
 
 func GetFormatLogFunc() func(log *Log) string {
-	loggerConfigLock.RLock()
-	defer loggerConfigLock.RUnlock()
-	return formatLogFunc
+	return (*formatVal)(atomic.LoadPointer(&formatFn)).format
 }
 
 func SetFormatLogFunc(f func(log *Log) string) {
-	loggerConfigLock.Lock()
-	defer loggerConfigLock.Unlock()
-	formatLogFunc = f
-
+	atomic.StorePointer(&formatFn, unsafe.Pointer(&formatVal{format: f}))
 }
 
 func formatLog(log *Log, timePart string) string {

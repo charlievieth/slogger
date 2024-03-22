@@ -19,11 +19,10 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 )
-
-var loggerConfigLock sync.RWMutex
 
 type Log struct {
 	Prefix     string
@@ -73,18 +72,14 @@ func SimpleLogStrippingDirs(prefix string, level Level, errorCode ErrorCode, cal
 // MaxLogSize values below this threshold are effectively ignored
 const MinimumMaxLogSizeThreshold = 100
 
-var maxLogSize = -1 // -1 means no truncation
+var maxLogSize int64 = -1 // -1 means no truncation
 
 func getMaxLogSize() int {
-	loggerConfigLock.RLock()
-	defer loggerConfigLock.RUnlock()
-	return maxLogSize
+	return int(atomic.LoadInt64(&maxLogSize))
 }
 
 func SetMaxLogSize(size int) {
-	loggerConfigLock.Lock()
-	defer loggerConfigLock.Unlock()
-	maxLogSize = size
+	atomic.StoreInt64(&maxLogSize, int64(size))
 }
 func getSizeInKb(n int) string {
 	return fmt.Sprintf("%.1f", float64(n)/1024)
@@ -192,22 +187,33 @@ func (self *Logger) StackfWithErrorCodeAndContext(level Level, errorCode ErrorCo
 	return self.logf(level, errorCode, messageFmt, context, args...)
 }
 
-var ignoredFileNames = []string{"logger.go"}
+var ignoredFileNames = unsafe.Pointer(&[]string{"logger.go"})
 
 // Add a file to the list of file names that slogger will skip when it identifies the source
 // of a message.  This is useful if you have a logging library built on top of slogger.
 // If you IgnoreThisFilenameToo(...) on the files of that library, logging messages
 // will be marked as coming from your code that calls your library, rather than from your library.
 func IgnoreThisFilenameToo(fn string) {
-	loggerConfigLock.Lock()
-	defer loggerConfigLock.Unlock()
-	ignoredFileNames = append(ignoredFileNames, fn)
+	var names []string
+	for {
+		// Don't append to p since that will be a race if len(*p) < cap(*p).
+		names = names[:0]
+		p := (*[]string)(atomic.LoadPointer(&ignoredFileNames))
+		if p != nil {
+			if names == nil {
+				names = make([]string, 0, len(*p)+1)
+			}
+			names = append(names, *p...)
+		}
+		names = append(names, fn)
+		if atomic.CompareAndSwapPointer(&ignoredFileNames, unsafe.Pointer(p), unsafe.Pointer(&names)) {
+			return
+		}
+	}
 }
 
 func getIgnoredFileNames() []string {
-	loggerConfigLock.RLock()
-	defer loggerConfigLock.RUnlock()
-	return ignoredFileNames
+	return *(*[]string)(atomic.LoadPointer(&ignoredFileNames))
 }
 
 func baseFuncNameForPC(pc uintptr) string {
