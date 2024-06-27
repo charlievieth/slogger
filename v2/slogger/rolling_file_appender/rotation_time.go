@@ -2,6 +2,7 @@ package rolling_file_appender
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
@@ -13,18 +14,28 @@ type RotationTime struct {
 	Filename string
 }
 
-type RotationTimeSlice [](*RotationTime)
+type RotationTimeSlice []*RotationTime
 
 func (self RotationTimeSlice) Len() int {
 	return len(self)
 }
 
-func (self RotationTimeSlice) Less(i, j int) bool {
-	if self[i].Time == self[j].Time {
-		return self[i].Serial < self[j].Serial
+// // WARN: dev only
+func (self RotationTimeSlice) String() string {
+	names := make([]string, 0, len(self))
+	for _, s := range self {
+		names = append(names, filepath.Base(s.Filename))
 	}
+	return fmt.Sprintf("%q", names)
+}
 
-	return self[i].Time.Before(self[j].Time)
+func (self RotationTimeSlice) Less(i, j int) bool {
+	r1 := self[i]
+	r2 := self[j]
+	if r1.Time.Before(r2.Time) {
+		return true
+	}
+	return r1.Time.Equal(r2.Time) && r1.Serial < r2.Serial
 }
 
 func (self RotationTimeSlice) Swap(i, j int) {

@@ -1,8 +1,11 @@
 package rolling_file_appender
 
 import (
+	"errors"
 	"fmt"
 )
+
+var ErrAppenderClose = errors.New("rolling_file_appender: appender closed")
 
 type CloseError struct {
 	Filename string

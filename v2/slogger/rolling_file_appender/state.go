@@ -61,7 +61,7 @@ func (self *state) write(path string) error {
 		return EncodeError{path, err}
 	}
 
-	return nil
+	return file.Close()
 }
 
 func (self *RollingFileAppender) statePath() string {
