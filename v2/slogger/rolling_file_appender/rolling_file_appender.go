@@ -19,20 +19,25 @@ package rolling_file_appender
 
 import (
 	"bufio"
-	"log"
-
-	"github.com/mongodb/slogger/v2/slogger"
-
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/mongodb/slogger/v2/slogger"
 )
+
+// Default interval at which to log file is flushed to disk with [os.File.Sync].
+const DefaultSyncInterval = time.Second
 
 type RollingFileAppender struct {
 	// These fields should not need to change
@@ -70,6 +75,10 @@ type RollingFileAppender struct {
 	initialized  bool          // compress loop initialized
 	closed       bool          // logger closed
 
+	// File syncing
+	lastSync     atomic.Pointer[time.Time]
+	syncInterval time.Duration
+
 	// TODO: remove this
 	errLog *log.Logger // Log for internal errors (testing only)
 }
@@ -84,6 +93,7 @@ type rollingFileAppenderBuilder struct {
 	maxUncompressedLogs  int
 	headerGenerator      func() []string
 	stringWriterCallback func(*os.File) slogger.StringWriter
+	syncInterval         time.Duration
 	errLog               *log.Logger // Log for internal errors (testing only)
 }
 
@@ -144,6 +154,7 @@ func NewBuilder(filename string, maxFileSize int64, maxDuration time.Duration, m
 		maxUncompressedLogs:  0,
 		headerGenerator:      headerGenerator,
 		stringWriterCallback: nil,
+		syncInterval:         DefaultSyncInterval,
 	}
 }
 
@@ -155,6 +166,18 @@ func (b *rollingFileAppenderBuilder) WithLogCompression(maxUncompressedLogs int)
 
 func (b *rollingFileAppenderBuilder) WithStringWriter(stringWriterCallback func(*os.File) slogger.StringWriter) *rollingFileAppenderBuilder {
 	b.stringWriterCallback = stringWriterCallback
+	return b
+}
+
+// WithSyncInterval sets the interval at which the log file is flushed to disk
+// or disables syncing if d is less than or equal to zero. If not set
+// [DefaultSyncInterval] is used.
+//
+// Syncing to disk is extremely expensive so be careful with this value.
+// Disabling syncing is both reasonable and matches the behavior of most other
+// log systems.
+func (b *rollingFileAppenderBuilder) WithSyncInterval(d time.Duration) *rollingFileAppenderBuilder {
+	b.syncInterval = d
 	return b
 }
 
@@ -214,6 +237,7 @@ func (b *rollingFileAppenderBuilder) Build() (*RollingFileAppender, error) {
 			appender.curFileSize = fileInfo.Size()
 		}
 
+		// WARN: remove this code
 		// WARN: this will cause tests to fail !!!
 		const Benchmark = false // WARN
 
@@ -230,7 +254,7 @@ func (b *rollingFileAppenderBuilder) Build() (*RollingFileAppender, error) {
 					return nil, err
 				}
 			} else {
-				if err = appender.stampStartTime(); err != nil {
+				if err = appender.stampStartTime(time.Now()); err != nil {
 					appender.file.Close()
 					return nil, err
 				}
@@ -286,7 +310,7 @@ func (self *RollingFileAppender) Append(log *slogger.Log) error {
 			if err == nil {
 				err = err2
 			} else {
-				err = fmt.Errorf("append: write error: %w rotate error: %w", err, err2)
+				err = fmt.Errorf("rolling_file_appender: write: %w rotate: %w", err, err2)
 			}
 		}
 	}
@@ -297,10 +321,8 @@ func (self *RollingFileAppender) closeFileLocked() error {
 	if self.file == nil {
 		return nil
 	}
-	// TODO: ignore fs.ErrClosed errors?
 	err := self.file.Sync()
 	if err != nil {
-		// WARN: don't use SyncError - this is the only place that uses it!
 		err = &SyncError{Filename: self.absPath, Err: err}
 	}
 	// Always close the file even if sync error'd.
@@ -313,7 +335,7 @@ func (self *RollingFileAppender) closeFileLocked() error {
 
 func (self *RollingFileAppender) closeLocked() error {
 	if self.closed {
-		return ErrAppenderClose
+		return ErrAppenderClosed
 	}
 	self.closed = true
 	if self.compressRotatedLogs {
@@ -330,25 +352,53 @@ func (self *RollingFileAppender) Close() error {
 	return self.closeLocked()
 }
 
-func (self *RollingFileAppender) Flush() error {
-	// NB(charlie): This method used to call os.File.Sync (fsync) which is
-	// extremely expensive and really not necessary for logs. Depending on
-	// the filesystem and underlying storage medium this can decrease write
-	// IOPs to the 10s or low 100s (on a M1 macOS calling fsync after each
-	// write decreases write IOPs by a factor of 3100x).
+func (self *RollingFileAppender) Flush() (err error) {
+	// NB(charlie): This method is extremely hot and is typically called after
+	// each log message is written. Previously, this method called Sync() each
+	// time, which is both extremely expensive and unnecessary.
 	//
-	// Calling fsync will also put additional pressure on the underlying storage
-	// system which may adversely impact other programs running on the system
-	// (e.g. a database).
+	// In the event of a loss of power and the drives not having an onboard
+	// capacitor or battery backup we'd stand to lose a small amount of data,
+	// but are at almost zero risk of corruption (append only writes to a
+	// journaled file system).
 	//
-	// Additionally, some Appenders like AsyncAppender call this method after
-	// each call to Append so this is often a very hot function.
+	// Regarding the performance impact, it is extreme and around 310x on a NVMe
+	// drive (this equate to ~250 IOPS on a M1 mac ~3k on EXT4). Additionally,
+	// this might put additional stress on the drive controller and have knock
+	// on effects.
 	//
-	// TODO(charlie): If at some point we wanted to sync the file to disk we
-	// should only do so periodically.
+	// As a compromise (since there will undoubtedly be resistance to this)
+	// we now optionally sync the file periodically so that at worst only a
+	// small amount of data will be lost in the event of a freak failure.
+
+	// Never sync the file.
+	if self.syncInterval <= 0 {
+		return nil
+	}
+
+	// Atomically load the last sync time and only sync if we're past the sync
+	// threshold and can CAS the current time pointer with the next one - this
+	// prevents concurrent calls to sync.
+	t := self.lastSync.Load()
+	if t == nil || time.Since(*t) >= self.syncInterval {
+		// CAS to prevent concurrent calls to sync.
+		now := time.Now()
+		if self.lastSync.CompareAndSwap(t, &now) {
+			// Hold lock since we need to synchronize around self.file
+			self.lock.Lock()
+			if self.file != nil {
+				err = self.file.Sync()
+			}
+			self.lock.Unlock()
+		}
+	}
+	if err != nil {
+		return &SyncError{Filename: self.absPath, Err: err}
+	}
 	return nil
 }
 
+// WARN WARN
 // WARN: compression is now asynchronous - should we wait for it to complete?
 func (self *RollingFileAppender) Rotate() error {
 	self.lock.Lock()
@@ -369,7 +419,7 @@ func (self *RollingFileAppender) Reopen() error {
 	defer self.lock.Unlock()
 
 	// close current log if we have one open
-	if err := self.closeLocked(); err != nil && err != ErrAppenderClose {
+	if err := self.closeLocked(); err != nil && err != ErrAppenderClosed {
 		return err
 	}
 
@@ -390,7 +440,7 @@ func (self *RollingFileAppender) Reopen() error {
 	self.logHeader()
 
 	// stamp start time
-	if err = self.stampStartTime(); err != nil {
+	if err = self.stampStartTime(time.Now()); err != nil {
 		return err
 	}
 
@@ -406,22 +456,11 @@ func (self *RollingFileAppender) Reopen() error {
 }
 
 func rotatedFilename(baseFilename string, t time.Time, serial int) string {
-	filename := fmt.Sprintf(
-		"%s.%d-%02d-%02dT%02d-%02d-%02d",
-		baseFilename,
-		t.Year(),
-		t.Month(),
-		t.Day(),
-		t.Hour(),
-		t.Minute(),
-		t.Second(),
-	)
-
+	stamp := t.Format("2006-01-02T15-04-05")
 	if serial > 0 {
-		filename = fmt.Sprintf("%s-%d", filename, serial)
+		return baseFilename + "." + stamp + "-" + strconv.Itoa(serial)
 	}
-
-	return filename
+	return baseFilename + "." + stamp
 }
 
 func (self *RollingFileAppender) appendSansSizeTracking(log *slogger.Log) (bytesWritten int, err error) {
@@ -486,20 +525,36 @@ func (self *RollingFileAppender) removeMaxRotatedLogs() error {
 	// otherwise remove enough of the oldest logfiles to bring us
 	// under the limit
 	sort.Sort(rotationTimes)
-	var first error
+	var errs []error
 	for _, rotationTime := range rotationTimes[:numLogsToDelete] {
 		if err := os.Remove(rotationTime.Filename); err != nil {
-			// Ignore errors due to the file not existing and only return
-			// the first error since stopping here breaks rotation.
-			if !os.IsNotExist(err) && first == nil {
-				first = err
+			// Ignore errors due to the file not existing which
+			// can happen if there is a race removing it.
+			if !os.IsNotExist(err) {
+				errs = append(errs, err)
 			}
 		}
 	}
-	if first != nil {
-		return &MinorRotationError{first}
+	if len(errs) != 0 {
+		return &MinorRotationError{Err: errors.Join(errs...)}
 	}
 	return nil
+}
+
+func (self *RollingFileAppender) rotateAndCompress() error {
+	self.compressLock.Lock()
+	defer self.compressLock.Unlock()
+	var err1 error
+	if self.compressRotatedLogs && self.maxUncompressedLogs > 0 {
+		if err1 = self.compressMaxUncompressedLogs(); err1 != nil {
+			return err1
+		}
+	}
+	err2 := self.removeMaxRotatedLogs()
+	if err2 != nil && err1 == nil {
+		err1 = err2
+	}
+	return err1
 }
 
 func (self *RollingFileAppender) compressMaxUncompressedLogs() error {
@@ -538,7 +593,7 @@ func (self *RollingFileAppender) compressMaxUncompressedLogs() error {
 
 func compressFile(name string) error {
 	// 256kb is the optimal buffer size on most systems as determined by the GNU
-	// coreutils team
+	// coreutils team.
 	//
 	// This script from coreutils can be instructive:
 	// https://github.com/coreutils/coreutils/blob/master/src/ioblksize.h#L24-L77
@@ -556,23 +611,18 @@ func compressFile(name string) error {
 		return err
 	}
 
-	// TODO: consider using a temp file (though this may lead to a race if
-	// compressMaxUncompressedLogs() is called while this is running - using
-	// singleflight would solve this
 	fo, err := os.OpenFile(name+".gz", os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
 	if err != nil {
-		// panic(err)
 		return err
 	}
 	defer fo.Close()
 
+	// Close and remove gzip file on error.
 	exit := func(err error) error {
 		fo.Close()
 		os.Remove(fo.Name()) // remove compressed log file on error
+		// TODO: wrap error here or let the caller handle it?
 		return err
-
-		// TODO: should we do this or let the caller handle it???
-		// return fmt.Errorf("rolling_file_appender: error compressing file %s: %w", err)
 	}
 
 	bw := bufio.NewWriterSize(fo, bufsize)
@@ -597,7 +647,7 @@ func compressFile(name string) error {
 	if err := fo.Close(); err != nil {
 		return exit(err)
 	}
-	_ = fi.Close() // ignore close error
+	_ = fi.Close() // ignore close error since we only read the file
 
 	// TODO(charlie): This appears to be a "nice to have" and was
 	// copied from the original implementation. An error here is
@@ -608,6 +658,9 @@ func compressFile(name string) error {
 	return os.Remove(name)
 }
 
+// WARN WARN WARN WARN WARN
+// We still want to run the loop even if compression is disabled
+// since we still need to rotate
 func (self *RollingFileAppender) compressLoop() {
 	if !self.compressRotatedLogs {
 		return
@@ -616,15 +669,19 @@ func (self *RollingFileAppender) compressLoop() {
 	for {
 		select {
 		case <-self.kick:
-			// TODO(charlie): log these errors either ourselves or write
-			// them to STDERR.
+			// if err := self.rotateAndCompress(); err != nil {
+			// 	self.errorf("compress: %v", err)
+			// }
+
+			// // TODO(charlie): log these errors either ourselves or write
+			// // them to STDERR.
 			if err := self.compressMaxUncompressedLogs(); err != nil {
 				// WARN: Log this error
 				self.errorf("compress: %v", err)
 			}
-			if err := self.removeMaxRotatedLogs(); err != nil {
-				self.errorf("remove max rotated logs: %v", err)
-			}
+			// // if err := self.removeMaxRotatedLogs(); err != nil {
+			// // 	self.errorf("remove max rotated logs: %v", err)
+			// // }
 		case <-self.stop:
 			// Check if there is a request to rotate logs before exiting
 			select {
@@ -658,73 +715,72 @@ func (self *RollingFileAppender) compressLogs() {
 	}
 }
 
-// WARN: this is an insane value
-const MAX_ROTATE_SERIAL_NUM = 1_000_000_000
-
-func (self *RollingFileAppender) renameLogFile(oldFilename string) error {
-	now := time.Now()
-
-	var newFilename string
-	// var err error
-
-	// TODO: read the directory to get a list of names and use that
-	// as the starting point for "serial".
-	for serial := 0; ; serial++ { // err == nil means file exists
-		if serial > MAX_ROTATE_SERIAL_NUM {
-			return &RenameError{
-				OldFilename: oldFilename,
-				NewFilename: newFilename,
-				Err:         fmt.Errorf("Reached max serial number: %d", MAX_ROTATE_SERIAL_NUM),
-			}
-		}
-		// TODO: we can cache the result of this
-		newFilename = rotatedFilename(self.absPath, now, serial)
-
-		if _, err := os.Lstat(newFilename); err != nil {
-			if os.IsNotExist(err) {
-				break
-			}
-			// WARN: handle/log any other error we encounter here
-			return err
-		}
+func renameLogFile(oldFilename string, now time.Time) error {
+	newFilename, err := nextLogFileName(oldFilename, time.Now())
+	if err != nil {
+		return err
 	}
-
 	if err := os.Rename(oldFilename, newFilename); err != nil {
-		return &RenameError{oldFilename, newFilename, err}
+		return err
 	}
 	return nil
 }
 
-// func (self *RollingFileAppender) renameLogFile_XXX(oldFilename string) error {
-// 	now := time.Now()
-// 	// TODO: read the directory to get a list of names and use that
-// 	// as the starting point for "serial".
-// 	for serial := 0; serial < 100_000; serial++ { // err == nil means file exists
-// 		// TODO: we can cache the result of this
-// 		name := rotatedFilename(self.absPath, now, serial)
-// 		_, err := os.Lstat(name)
-// 		if err != nil && !os.IsNotExist(err) {
-// 			return err
-// 		}
-// 		if err == nil {
-// 			continue
-// 		}
-// 		// Exclusively create the file to prevent TOCTOU bugs.
-// 		f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0666)
-// 		if err != nil {
-// 			continue
-// 		}
-// 		f.Close()
-// 		if err := os.Rename(oldFilename, name); err != nil {
-// 			return &RenameError{oldFilename, name, err}
-// 		}
-// 	}
-// 	return &RenameError{
-// 		OldFilename: oldFilename,
-// 		NewFilename: rotatedFilename(self.absPath, now, 100_000),
-// 		Err:         fmt.Errorf("Reached max serial number: %d", MAX_ROTATE_SERIAL_NUM),
-// 	}
-// }
+func createFileExclusive(name string) (created bool) {
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL, 0666)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+func nextLogFileName(oldFilename string, now time.Time) (newFilename string, _ error) {
+	// Fast path if we don't have conflicting filenames.
+	if name := rotatedFilename(oldFilename, now, 0); createFileExclusive(name) {
+		return name, nil
+	}
+
+	// Perform a binary search to find the next file name.
+	//
+	// Small values are *much* more common and the larger the value the more
+	// stat(2) calls the binary search needs to make (which are slow) - so we
+	// front-load a few small values then quickly ramp up to large values since
+	// the difference in runtime between 1024 and 2^30 is relatively small.
+	//
+	// NB: The larger values are really only for completeness and to handle the
+	// pathological case of something essentially DOS'ing us by creating these
+	// files or a badly configured program using thousands of appenders with
+	// extremely small rotation values.
+	for _, n := range []int{4, 8, 16, 128, 1024, 1024 * 1024 * 1024} {
+		for {
+			var err error
+			i := sort.Search(n, func(m int) bool {
+				_, err = os.Lstat(rotatedFilename(oldFilename, now, m))
+				return err != nil && os.IsNotExist(err)
+			})
+			if err != nil && !os.IsNotExist(err) {
+				return "", err
+			}
+			if i == n {
+				break // search exhausted - continue outer loop
+			}
+			// Exclusively create the file to ensure it
+			// does not exist and prevent TOCTOU bugs.
+			newFilename = rotatedFilename(oldFilename, now, i)
+			if createFileExclusive(newFilename) {
+				return newFilename, nil
+			}
+		}
+	}
+
+	err := &RenameError{
+		OldFilename: oldFilename,
+		NewFilename: newFilename,
+		Err:         fmt.Errorf("Reached max serial number: %d", 1024*1024*1024),
+	}
+	return "", err
+}
 
 func (self *RollingFileAppender) rotate() error {
 	// close current log if we have one open
@@ -736,7 +792,8 @@ func (self *RollingFileAppender) rotate() error {
 	// TODO: we should use the same timestamp for both renaming and stamping
 
 	// rename old log
-	err := self.renameLogFile(self.absPath)
+	now := time.Now()
+	err := renameLogFile(self.absPath, now)
 	if err != nil {
 		return err
 	}
@@ -749,13 +806,15 @@ func (self *RollingFileAppender) rotate() error {
 	self.logHeader()
 
 	// stamp start time
-	if err := self.stampStartTime(); err != nil {
+	if err := self.stampStartTime(now); err != nil {
 		return err
 	}
 
 	self.compressLogs()
 
-	// WARN: we should do this in compression and not inline here
+	// WARN: we should do this in the compression loop
+	// by running it even if compression is not enabled
+	// *basically turn it into a "rotate loop"
 	self.removeMaxRotatedLogs()
 
 	return nil
@@ -788,105 +847,11 @@ func (self *RollingFileAppender) loadState() error {
 	return nil
 }
 
-func (self *RollingFileAppender) stampStartTime() error {
-	state := newState(time.Now())
+func (self *RollingFileAppender) stampStartTime(now time.Time) error {
+	state := newState(now)
 	if err := state.write(self.statePath()); err != nil {
 		return err
 	}
 	self.state = state
 	return nil
 }
-
-// WARN: figure out what we want to do with this thing
-/*
-type writeSyncer struct {
-	*os.File
-	mu sync.Mutex
-	// file          *os.File
-	flushInterval time.Duration
-	stopped       bool
-	initialized   bool
-	done          chan struct{}
-	stop          chan struct{}
-	ticker        *time.Ticker
-}
-
-func (w *writeSyncer) initialize() {
-	if w.flushInterval == 0 {
-		w.flushInterval = time.Second * 10
-	}
-	w.done = make(chan struct{})
-	w.stop = make(chan struct{})
-	w.ticker = time.NewTicker(w.flushInterval)
-	w.initialized = true
-	go func() {
-		defer close(w.done)
-		select {
-		case <-w.ticker.C:
-			_ = w.File.Sync()
-		case <-w.stop:
-			return
-		}
-	}()
-}
-
-func (w *writeSyncer) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.initialized {
-		w.initialize()
-	}
-	return w.File.Write(p)
-}
-
-func (w *writeSyncer) WriteString(s string) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.initialized {
-		w.initialize()
-	}
-	return w.File.WriteString(s)
-}
-
-func (w *writeSyncer) doClose() (stopped bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.initialized {
-		return false
-	}
-
-	if w.stopped {
-		return true
-	}
-	w.stopped = true
-
-	// Stop the flush loop and wait for it to exit.
-	w.ticker.Stop()
-	close(w.stop)
-	<-w.done
-
-	return false
-}
-
-func (w *writeSyncer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.initialized && !w.stopped {
-		// Stop the flush loop and wait for it to exit.
-		w.ticker.Stop()
-		close(w.stop)
-		<-w.done
-		w.stopped = true
-	}
-	if !w.stopped {
-		close(w.stop)
-		w.stopped = true
-	}
-	// if !w.doClose() {
-	// 	w.file.Sync()
-	// }
-	return w.File.Close()
-}
-*/

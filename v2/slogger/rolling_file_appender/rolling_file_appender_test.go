@@ -19,20 +19,21 @@ import (
 	"compress/gzip"
 	crand "crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"io"
-	"log"
-	"os/exec"
-	"sort"
-
-	"github.com/mongodb/slogger/v2/slogger"
-	. "github.com/mongodb/slogger/v2/slogger/test_util"
-
 	"io/ioutil"
+	"log"
+	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mongodb/slogger/v2/slogger"
+	. "github.com/mongodb/slogger/v2/slogger/test_util"
 )
 
 const rfaTestLogDir = "log"
@@ -408,6 +409,7 @@ func TestCompressionDoesNotBlock(t *testing.T) {
 	appender.Close()
 }
 
+// WARN: remove
 func BenchmarkSync(b *testing.B) {
 	f, err := os.Create(b.TempDir() + "/bench.txt")
 	if err != nil {
@@ -423,9 +425,9 @@ func BenchmarkSync(b *testing.B) {
 		if _, err := f.Write(data); err != nil {
 			b.Fatal(err)
 		}
-		// if err := f.Sync(); err != nil {
-		// 	b.Fatal(err)
-		// }
+		if err := f.Sync(); err != nil {
+			b.Fatal(err)
+		}
 		n += len(data)
 		if n >= 1024*1024*128 {
 			b.StopTimer()
@@ -509,10 +511,6 @@ func listLogFiles(t *testing.T) []string {
 	return a
 }
 
-func numLogFiles(t *testing.T) int {
-	return len(listLogFiles(t))
-}
-
 func readLog(test *testing.T, logPath string) string {
 	bytes, err := ioutil.ReadFile(logPath)
 	if err != nil {
@@ -583,6 +581,7 @@ func TestAsyncCompression(t *testing.T) {
 	t.Fatal("FIXME") // WARN
 }
 
+// WARN: remove this
 func tree(dir string) {
 	cmd := exec.Command("tree", dir)
 	cmd.Stdout = os.Stdout
@@ -608,6 +607,144 @@ func TestGzipCompressSize(t *testing.T) {
 	gw.Write(data)
 }
 
+func BenchmarkFlush(b *testing.B) {
+	tmp := tempDir(b)
+	logName := filepath.Join(tmp, "test.log")
+	builder := NewBuilder(logName, 10, 10, 10, true, nil).WithLogCompression(5)
+	appender, err := builder.Build()
+	if err != nil {
+		b.Fatal(err)
+	}
+	appender.syncInterval = time.Millisecond * 100
+	ll := slogger.Logger{
+		Prefix:    "compress_test",
+		Appenders: []slogger.Appender{appender},
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ll.Flush()
+		}
+	})
+}
+
+func TestRotatedFilename(t *testing.T) {
+	// Reference implementation - from the old code
+	ref := func(baseFilename string, t time.Time, serial int) string {
+		filename := fmt.Sprintf(
+			"%s.%d-%02d-%02dT%02d-%02d-%02d",
+			baseFilename,
+			t.Year(),
+			t.Month(),
+			t.Day(),
+			t.Hour(),
+			t.Minute(),
+			t.Second(),
+		)
+		if serial > 0 {
+			filename = fmt.Sprintf("%s-%d", filename, serial)
+		}
+		return filename
+	}
+
+	rr := rand.New(rand.NewSource(1))
+	now := time.Now()
+	const limit = int64(time.Hour * 24 * 365)
+	for i := 0; i < 100; i++ {
+		for serial := 0; serial < 3; serial++ {
+			tt := now.Add(time.Duration(rr.Int63n(limit)))
+			want := ref("test.log", tt, serial)
+			got := rotatedFilename("test.log", tt, serial)
+			if got != want {
+				t.Errorf("rotatedFilename(%q, %s, %d) = %q; want: %q", "test.log", tt, serial, got, want)
+			}
+		}
+	}
+}
+
+func touch(t testing.TB, name string) {
+	t.Helper()
+	f, err := os.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNextLogFileName(t *testing.T) {
+	N := 1024 + 1
+	if testing.Short() {
+		N = 100
+	}
+
+	base := filepath.Join(t.TempDir(), "test.log")
+	touch(t, base)
+
+	now := time.Now()
+
+	// Create a file without the serial number - needed for the
+	// below test
+	touch(t, rotatedFilename(base, now, 0))
+
+	for i := 1; i < N; i++ {
+		touch(t, rotatedFilename(base, now, i))
+		want := rotatedFilename(base, now, i+1)
+		got, err := nextLogFileName(base, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%d: %q != %q", i, filepath.Base(got), filepath.Base(want))
+		}
+	}
+}
+
+// func BenchmarkRenameLogFile(b *testing.B) {
+// 	const newFunc = false
+// 	tmp := tempDir(b)
+// 	fmt.Println(tmp)
+// 	basePath := filepath.Join(tmp, "test.log")
+// 	// basePath := filepath.Join(b.TempDir(), "test.log")
+// 	touch(b, basePath)
+// 	now := time.Now()
+// 	for i := 1; i <= 2; i++ {
+// 		f, err := os.Create(rotatedFilename(basePath, now, i))
+// 		if err != nil {
+// 			b.Fatal(err)
+// 		}
+// 		f.Close()
+// 	}
+// 	ra := RollingFileAppender{absPath: basePath}
+// 	_ = ra
+// 	name, err := ra.renameLogFile_Binary(now, ra.absPath)
+// 	if err != nil {
+// 		b.Fatal(err)
+// 	}
+// 	want := rotatedFilename(basePath, now, 3)
+// 	if name != want {
+// 		b.Fatalf("%q != %q", name, want)
+// 	}
+// 	b.ResetTimer()
+// 	b.ReportAllocs()
+// 	for i := 0; i < b.N; i++ {
+// 		if newFunc {
+// 			_, err := renameLogFile(basePath, now)
+// 			if err != nil {
+// 				b.Fatal(err)
+// 			}
+// 		} else {
+// 			err := ra.renameLogFile(basePath, now)
+// 			if err != nil {
+// 				b.Fatal(err)
+// 			}
+// 		}
+// 	}
+// }
+
+// WARN: DELETE
 func BenchmarkRotationTimeSlice(b *testing.B) {
 	tmp := tempDir(b)
 	logName := filepath.Join(tmp, "test.log")
@@ -666,6 +803,13 @@ func BenchmarkRotationTimeSlice(b *testing.B) {
 	// 		b.Fatal(err)
 	// 	}
 	// }
+}
+
+func BenchmarkRotatedFilename(b *testing.B) {
+	now := time.Now()
+	for i := 0; i < b.N; i++ {
+		rotatedFilename("/var/log/my_service/logs/agent.log", now, 0)
+	}
 }
 
 // func TestRotationTimeSlice(t *testing.T) {

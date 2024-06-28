@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-var ErrAppenderClose = errors.New("rolling_file_appender: appender closed")
+var ErrAppenderClosed = errors.New("rolling_file_appender: appender closed")
 
 type CloseError struct {
 	Filename string
@@ -30,7 +30,7 @@ type MinorRotationError struct {
 }
 
 func (self MinorRotationError) Error() string {
-	return ("rolling_file_appender: minor error while rotating logs: " + self.Err.Error())
+	return "rolling_file_appender: minor error while rotating logs: " + self.Err.Error()
 }
 
 func IsMinorRotationError(err error) bool {
