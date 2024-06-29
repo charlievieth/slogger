@@ -65,22 +65,23 @@ type RollingFileAppender struct {
 	// lock should also be held when reading or writing to state.
 	state *state
 
-	// Held when compressing logs. This is a separate mutex since
-	// compression happens in its own goroutine and we don't want
+	// Held when rotating logs. This is a separate mutex since
+	// rotation happens in its own goroutine and we don't want
 	// to block the logger.
-	compressLock sync.Mutex
-	kick         chan struct{} // trigger compression
-	stop         chan struct{} // close to stop compress loop
-	done         chan struct{} // closed after the compress loop exits
-	initialized  bool          // compress loop initialized
-	closed       bool          // logger closed
+	rotateLock  sync.Mutex
+	kick        chan struct{} // trigger rotation / compression
+	stop        chan struct{} // close to stop rotate loop
+	done        chan struct{} // closed after the rotate loop exits
+	initialized bool          // rotate loop initialized
+	closed      bool          // appender closed / rotate loop stopped
 
 	// File syncing
 	lastSync     atomic.Pointer[time.Time]
 	syncInterval time.Duration
 
-	// TODO: remove this
-	errLog *log.Logger // Log for internal errors (testing only)
+	// Log for internal rotation / compression errors since we
+	// cannot report them to the caller since the op is async.
+	errLog *log.Logger
 }
 
 type rollingFileAppenderBuilder struct {
@@ -213,7 +214,7 @@ func (b *rollingFileAppenderBuilder) Build() (*RollingFileAppender, error) {
 		absPath:              absPath,
 		headerGenerator:      b.headerGenerator,
 		stringWriterCallback: b.stringWriterCallback,
-		errLog:               b.errLog, // WARN: testing only
+		errLog:               b.errLog,
 		kick:                 make(chan struct{}, 1),
 		stop:                 make(chan struct{}),
 		done:                 make(chan struct{}),
@@ -221,7 +222,7 @@ func (b *rollingFileAppenderBuilder) Build() (*RollingFileAppender, error) {
 
 	fileInfo, err := os.Stat(absPath)
 	if err == nil && b.rotateIfExists { // err == nil means file exists
-		return appender, appender.rotate()
+		return appender, appender.rotate(false)
 	} else {
 		// we're either creating a new log file or appending to the current one
 		appender.file, err = os.OpenFile(
@@ -306,7 +307,7 @@ func (self *RollingFileAppender) Append(log *slogger.Log) error {
 	self.curFileSize += int64(n)
 
 	if self.shouldRotate() {
-		if err2 := self.rotate(); err2 != nil {
+		if err2 := self.rotate(false); err2 != nil {
 			if err == nil {
 				err = err2
 			} else {
@@ -338,11 +339,9 @@ func (self *RollingFileAppender) closeLocked() error {
 		return ErrAppenderClosed
 	}
 	self.closed = true
-	if self.compressRotatedLogs {
-		self.compressLogs()
-		close(self.stop)
-		<-self.done
-	}
+	self.rotateLogsAsync()
+	close(self.stop)
+	<-self.done
 	return self.closeFileLocked()
 }
 
@@ -355,21 +354,23 @@ func (self *RollingFileAppender) Close() error {
 func (self *RollingFileAppender) Flush() (err error) {
 	// NB(charlie): This method is extremely hot and is typically called after
 	// each log message is written. Previously, this method called Sync() each
-	// time, which is both extremely expensive and unnecessary.
+	// time, which is both extremely expensive and often unnecessary.
 	//
-	// In the event of a loss of power and the drives not having an onboard
-	// capacitor or battery backup we'd stand to lose a small amount of data,
-	// but are at almost zero risk of corruption (append only writes to a
-	// journaled file system).
+	// The only realistic case in which we'd lose log data is if there is a
+	// power loss and the drive not having an onboard capacitor or battery
+	// backup. In that event, we'd expect to see lost data (maybe a few log
+	// lines) but data corruption would be rare since we write an append only
+	// file on what is most likely a journaled file system.
 	//
 	// Regarding the performance impact, it is extreme and around 310x on a NVMe
 	// drive (this equate to ~250 IOPS on a M1 mac ~3k on EXT4). Additionally,
 	// this might put additional stress on the drive controller and have knock
-	// on effects.
+	// on effects to other processes trying to write/read (like a database).
 	//
 	// As a compromise (since there will undoubtedly be resistance to this)
 	// we now optionally sync the file periodically so that at worst only a
-	// small amount of data will be lost in the event of a freak failure.
+	// small amount of data will be lost in the event of a power loss or any
+	// other freak failure.
 
 	// Never sync the file.
 	if self.syncInterval <= 0 {
@@ -398,13 +399,11 @@ func (self *RollingFileAppender) Flush() (err error) {
 	return nil
 }
 
-// WARN WARN
-// WARN: compression is now asynchronous - should we wait for it to complete?
 func (self *RollingFileAppender) Rotate() error {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 
-	return self.rotate()
+	return self.rotate(true)
 }
 
 // WARN: This is not used in the agent and I can't think of any reason
@@ -449,6 +448,7 @@ func (self *RollingFileAppender) Reopen() error {
 
 	// Reset the close channels
 	self.closed = false
+	self.initialized = false
 	self.stop = make(chan struct{})
 	self.done = make(chan struct{})
 
@@ -541,28 +541,10 @@ func (self *RollingFileAppender) removeMaxRotatedLogs() error {
 	return nil
 }
 
-func (self *RollingFileAppender) rotateAndCompress() error {
-	self.compressLock.Lock()
-	defer self.compressLock.Unlock()
-	var err1 error
-	if self.compressRotatedLogs && self.maxUncompressedLogs > 0 {
-		if err1 = self.compressMaxUncompressedLogs(); err1 != nil {
-			return err1
-		}
-	}
-	err2 := self.removeMaxRotatedLogs()
-	if err2 != nil && err1 == nil {
-		err1 = err2
-	}
-	return err1
-}
-
 func (self *RollingFileAppender) compressMaxUncompressedLogs() error {
-	if self.maxUncompressedLogs < 0 {
+	if !self.compressRotatedLogs || self.maxUncompressedLogs < 0 {
 		return nil
 	}
-	self.compressLock.Lock() // TODO: with better synchronization we should not need this
-	defer self.compressLock.Unlock()
 
 	rotationTimes, err := self.rotationTimeSlice()
 	if err != nil {
@@ -613,6 +595,9 @@ func compressFile(name string) error {
 
 	fo, err := os.OpenFile(name+".gz", os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
 	if err != nil {
+		if os.IsExist(err) {
+			return nil // Race: someone else started compressing this before us
+		}
 		return err
 	}
 	defer fo.Close()
@@ -658,40 +643,37 @@ func compressFile(name string) error {
 	return os.Remove(name)
 }
 
-// WARN WARN WARN WARN WARN
-// We still want to run the loop even if compression is disabled
-// since we still need to rotate
-func (self *RollingFileAppender) compressLoop() {
-	if !self.compressRotatedLogs {
-		return
+func (self *RollingFileAppender) rotateAndCompress() error {
+	self.rotateLock.Lock()
+	defer self.rotateLock.Unlock()
+
+	var err1 error
+	if self.compressRotatedLogs && self.maxUncompressedLogs > 0 {
+		if err1 = self.compressMaxUncompressedLogs(); err1 != nil {
+			return err1
+		}
 	}
+	err2 := self.removeMaxRotatedLogs()
+	if err2 != nil && err1 == nil {
+		err1 = err2
+	}
+	return err1
+}
+
+func (self *RollingFileAppender) rotateLoop() {
 	defer close(self.done)
 	for {
 		select {
 		case <-self.kick:
-			// if err := self.rotateAndCompress(); err != nil {
-			// 	self.errorf("compress: %v", err)
-			// }
-
-			// // TODO(charlie): log these errors either ourselves or write
-			// // them to STDERR.
-			if err := self.compressMaxUncompressedLogs(); err != nil {
-				// WARN: Log this error
-				self.errorf("compress: %v", err)
+			if err := self.rotateAndCompress(); err != nil {
+				self.errorf("rolling_file_appender: rotate and compress: %v", err)
 			}
-			// // if err := self.removeMaxRotatedLogs(); err != nil {
-			// // 	self.errorf("remove max rotated logs: %v", err)
-			// // }
 		case <-self.stop:
 			// Check if there is a request to rotate logs before exiting
 			select {
 			case <-self.kick:
-				if err := self.compressMaxUncompressedLogs(); err != nil {
-					// WARN: Log this error
-					self.errorf("compress: %v", err)
-				}
-				if err := self.removeMaxRotatedLogs(); err != nil {
-					self.errorf("remove max rotated logs: %v", err)
+				if err := self.rotateAndCompress(); err != nil {
+					self.errorf("rolling_file_appender: rotate and compress: %v", err)
 				}
 			default:
 			}
@@ -700,14 +682,11 @@ func (self *RollingFileAppender) compressLoop() {
 	}
 }
 
-func (self *RollingFileAppender) compressLogs() {
+func (self *RollingFileAppender) rotateLogsAsync() {
 	// NOTE: lock much be held
-	if !self.compressRotatedLogs {
-		return
-	}
 	if !self.initialized {
 		self.initialized = true
-		go self.compressLoop()
+		go self.rotateLoop()
 	}
 	select {
 	case self.kick <- struct{}{}:
@@ -736,11 +715,18 @@ func createFileExclusive(name string) (created bool) {
 }
 
 func nextLogFileName(oldFilename string, now time.Time) (newFilename string, _ error) {
+	// NOTE: This function creates newFilename since that is the only way to
+	// guarantee that it does not exist. This is okay, since we re-open and
+	// truncate it.
+
 	// Fast path if we don't have conflicting filenames.
 	if name := rotatedFilename(oldFilename, now, 0); createFileExclusive(name) {
 		return name, nil
 	}
 
+	// A file exists with the name we want. To handle this conflict we append
+	// an numeric serial/ordinal suffix to the name (e.g. "foo-1", "foo-2").
+	//
 	// Perform a binary search to find the next file name.
 	//
 	// Small values are *much* more common and the larger the value the more
@@ -782,14 +768,12 @@ func nextLogFileName(oldFilename string, now time.Time) (newFilename string, _ e
 	return "", err
 }
 
-func (self *RollingFileAppender) rotate() error {
+func (self *RollingFileAppender) rotate(force bool) error {
 	// close current log if we have one open
 	if err := self.closeFileLocked(); err != nil {
 		return err
 	}
 	self.curFileSize = 0
-
-	// TODO: we should use the same timestamp for both renaming and stamping
 
 	// rename old log
 	now := time.Now()
@@ -810,13 +794,11 @@ func (self *RollingFileAppender) rotate() error {
 		return err
 	}
 
-	self.compressLogs()
-
-	// WARN: we should do this in the compression loop
-	// by running it even if compression is not enabled
-	// *basically turn it into a "rotate loop"
-	self.removeMaxRotatedLogs()
-
+	// Force rotation and possibly compression (used by Rotate())
+	if force {
+		return self.rotateAndCompress()
+	}
+	self.rotateLogsAsync() // Async compression
 	return nil
 }
 
