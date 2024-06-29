@@ -406,9 +406,6 @@ func (self *RollingFileAppender) Rotate() error {
 	return self.rotate(true)
 }
 
-// WARN: This is not used in the agent and I can't think of any reason
-// why this function should exist.
-//
 // Useful for manual log rotation.  For example, logrotated may rename
 // the log file and then ask us to reopen it.  Before reopening it we
 // will be writing to the renamed log file.  After reopening we will
@@ -422,7 +419,6 @@ func (self *RollingFileAppender) Reopen() error {
 		return err
 	}
 
-	// WARN: read the size from the opened file (otherwise there is a race)
 	fileInfo, err := os.Stat(self.absPath)
 	if err == nil { // file exists
 		self.curFileSize = fileInfo.Size()
@@ -564,11 +560,16 @@ func (self *RollingFileAppender) compressMaxUncompressedLogs() error {
 	}
 
 	sort.Sort(uncompressedRotationTimes)
+	var errs []error
 	for _, rt := range uncompressedRotationTimes[:numLogsToCompress] {
 		if err := compressFile(rt.Filename); err != nil {
-			return fmt.Errorf("rolling_file_appender: compressing file %s: %w",
-				rt.Filename, err)
+			// Don't stop on the first error since that will prevent us
+			// from compressing the remaining files.
+			errs = append(errs, fmt.Errorf("compressing file %s: %w", rt.Filename, err))
 		}
+	}
+	if len(errs) != 0 {
+		return fmt.Errorf("rolling_file_appender: %w", errors.Join(errs...))
 	}
 	return nil
 }
