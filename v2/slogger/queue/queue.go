@@ -51,6 +51,7 @@ func (q *Queue) Enqueue(item interface{}) {
 			// force a dequeue in order to make room
 			select {
 			case item := <-q.items:
+				// WARN: this could block
 				if q.onForcedDequeue != nil {
 					q.onForcedDequeue(item)
 				}

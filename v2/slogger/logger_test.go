@@ -413,3 +413,44 @@ func TestIgnoreThisFilenameToo(t *testing.T) {
 		}
 	}
 }
+
+type nopAppender struct{}
+
+func (nopAppender) Append(log *Log) error {
+	_ = GetFormatLogFunc()(log)
+	return nil
+}
+
+func (nopAppender) Flush() error { return nil }
+
+func BenchmarkLoggerNoOp(b *testing.B) {
+	// // Bonkers that this is all done with globals and not on a per-logger basis
+	// fn := GetFormatLogFunc()
+	// SetFormatLogFunc(FormatLogWithTimezone)
+	// b.Cleanup(func() {
+	// 	SetFormatLogFunc(fn)
+	// })
+
+	ll := &Logger{
+		Prefix:    "agent.OplogTail",
+		Appenders: []Appender{nopAppender{}},
+	}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// ll.Logf(ERROR, "message")
+			ll.LogfWithErrorCodeAndContext(ERROR, 123, "message", nil)
+			// ll.LogfWithErrorCodeAndContext(level, errorCode, messageFmt, context, ...)
+		}
+	})
+}
+
+func fn1() { fn2() }
+func fn2() { fn3() }
+func fn3() { fn4() }
+func fn4() { _ = stacktrace() }
+
+func BenchmarkStacktrace(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		fn1()
+	}
+}

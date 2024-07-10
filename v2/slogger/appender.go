@@ -16,8 +16,9 @@ package slogger
 
 import (
 	"bytes"
-	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 )
@@ -27,6 +28,10 @@ type Appender interface {
 	Flush() error
 }
 
+// TODO: consider renaming to formatFuncContainer
+//
+// formatVal is a container that allows use to atomically store/access
+// format functions.
 type formatVal struct {
 	format func(log *Log) string
 }
@@ -38,66 +43,81 @@ func GetFormatLogFunc() func(log *Log) string {
 }
 
 func SetFormatLogFunc(f func(log *Log) string) {
+	if f == nil {
+		panic("slogger: nil format log function")
+	}
 	atomic.StorePointer(&formatFn, unsafe.Pointer(&formatVal{format: f}))
 }
 
+// TODO: consider passing just the time layout
 func formatLog(log *Log, timePart string) string {
-
-	errorCodeStr := ""
+	var buf [20]byte
+	typ := log.Level.Type()
+	msg := log.Message()
+	var w strings.Builder
+	// 50 is roughly the minimum size of a log with an error code but we pad
+	// it to 64 to have a bit of headroom in the buffer
+	w.Grow(64 + len(timePart) + len(log.Prefix) + len(typ) +
+		len(log.Filename) + len(log.FuncName) + len(msg))
+	w.WriteString(timePart)
+	w.WriteString(" [")
+	w.WriteString(log.Prefix)
+	w.WriteByte('.')
+	w.WriteString(typ)
+	w.WriteString("] [")
+	w.WriteString(log.Filename)
+	w.WriteByte(':')
+	w.WriteString(log.FuncName)
+	w.WriteByte(':')
+	w.Write(strconv.AppendInt(buf[:0], int64(log.Line), 10))
+	w.WriteString("] ")
 	if log.ErrorCode != NoErrorCode {
-		errorCodeStr += fmt.Sprintf("[%v] ", log.ErrorCode)
+		w.WriteByte('[')
+		w.Write(strconv.AppendInt(buf[:0], int64(log.ErrorCode), 10))
+		w.WriteString("] ")
 	}
-
-	return fmt.Sprintf("%v [%v.%v] [%v:%v:%d] %v%v\n",
-		timePart, log.Prefix, log.Level.Type(),
-		log.Filename, log.FuncName, log.Line,
-		errorCodeStr,
-		log.Message())
+	w.WriteString(msg)
+	w.WriteByte('\n')
+	return w.String()
 }
 
-func convertOffsetToString(offset int) string {
-	if offset == 0 {
-		return "+0000"
+func formatLogX(log *Log, timeLayout string) string {
+	typ := log.Level.Type()
+	msg := log.Message()
+	// 50 is roughly the minimum size of a log with an error code but we pad
+	// it to 64 to have a bit of headroom in the buffer
+	b := make([]byte, 0, 64+len(timeLayout)+len(log.Prefix)+len(typ)+
+		len(log.Filename)+len(log.FuncName)+len(msg))
+	b = log.Timestamp.AppendFormat(b, timeLayout)
+	b = append(b, " ["...)
+	b = append(b, log.Prefix...)
+	b = append(b, '.')
+	b = append(b, typ...)
+	b = append(b, "] ["...)
+	b = append(b, log.Filename...)
+	b = append(b, ':')
+	b = append(b, log.FuncName...)
+	b = append(b, ':')
+	b = strconv.AppendInt(b, int64(log.Line), 10)
+	b = append(b, "] "...)
+	if log.ErrorCode != NoErrorCode {
+		b = append(b, '[')
+		b = strconv.AppendInt(b, int64(log.ErrorCode), 10)
+		b = append(b, "] "...)
 	}
-	var sign string
-	if offset > 0 {
-		sign = "+"
-	} else {
-		sign = "-"
-		offset *= -1
-	}
-	hoursOffset := float32(offset) / 3600.0
-	var leadingZero string
-	if hoursOffset > -9 && hoursOffset < 9 {
-		leadingZero = "0"
-	}
-	return fmt.Sprintf("%s%s%.0f", sign, leadingZero, hoursOffset*100.0)
+	b = append(b, msg...)
+	b = append(b, '\n')
+	return unsafe.String(&b[0], len(b))
 }
 
+// TODO: fix
+// WARN: the agent uses this
 func FormatLogWithTimezone(log *Log) string {
-	year, month, day := log.Timestamp.Date()
-	hour, min, sec := log.Timestamp.Clock()
-	millisec := log.Timestamp.Nanosecond() / 1000000
-	_, offset := log.Timestamp.Zone() // offset in seconds
-
-	return formatLog(log, fmt.Sprintf("[%.4d-%.2d-%.2dT%.2d:%.2d:%.2d.%.3d%s]",
-		year, month, day,
-		hour, min, sec,
-		millisec,
-		convertOffsetToString(offset)),
-	)
+	return formatLog(log, log.Timestamp.Format("[2006-01-02T15:04:05.000-0700]"))
 }
 
 func FormatLog(log *Log) string {
-	year, month, day := log.Timestamp.Date()
-	hour, min, sec := log.Timestamp.Clock()
-	millisec := log.Timestamp.Nanosecond() / 1000000
-
-	return formatLog(log, fmt.Sprintf("[%.4d/%.2d/%.2d %.2d:%.2d:%.2d.%.3d]",
-		year, month, day,
-		hour, min, sec,
-		millisec,
-	))
+	return formatLog(log, log.Timestamp.Format("[2006/01/02 15:04:05.000]"))
 }
 
 type StringWriter interface {
@@ -127,6 +147,7 @@ func StdErrAppender() *FileAppender {
 	return &FileAppender{os.Stderr}
 }
 
+// TODO: don't use a file here - find a way to bybass
 func DevNullAppender() (*FileAppender, error) {
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
@@ -157,6 +178,7 @@ func (self StringAppender) Flush() error {
 // Return true if the log should be passed to the underlying
 // `Appender`
 type Filter func(log *Log) bool
+
 type FilterAppender struct {
 	Appender Appender
 	Filter   Filter

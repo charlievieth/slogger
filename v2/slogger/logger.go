@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -217,6 +218,7 @@ func getIgnoredFileNames() []string {
 }
 
 func baseFuncNameForPC(pc uintptr) string {
+	// WARN: FuncForPC may return nil
 	fullFuncName := runtime.FuncForPC(pc).Name()
 
 	// strip github.com/mongodb/slogger/v2slogger.BaseFuncNameForPC down to BaseFuncNameForPC
@@ -306,25 +308,24 @@ const (
 	topLevel
 )
 
-var strToLevel map[string]Level
+var strToLevel = map[string]Level{
+	"trace": TRACE,
+	"debug": DEBUG,
+	"info":  INFO,
+	"warn":  WARN,
+	"error": ERROR,
+	"fatal": FATAL,
+	"off":   OFF,
+}
 
-var levelToStr []string
-
-func init() {
-	strToLevel = map[string]Level{
-		"off":   OFF,
-		"trace": TRACE,
-		"debug": DEBUG,
-		"info":  INFO,
-		"warn":  WARN,
-		"error": ERROR,
-		"fatal": FATAL,
-	}
-
-	levelToStr = make([]string, len(strToLevel))
-	for str, level := range strToLevel {
-		levelToStr[uint8(level)] = str
-	}
+var levelToStr = [...]string{
+	TRACE: "trace",
+	DEBUG: "debug",
+	INFO:  "info",
+	WARN:  "warn",
+	ERROR: "error",
+	FATAL: "fatal",
+	OFF:   "off",
 }
 
 func NewLevel(levelStr string) (Level, error) {
@@ -343,11 +344,10 @@ func (self Level) String() string {
 }
 
 func (self Level) Type() string {
-	if self >= topLevel {
-		return "off?"
+	if self < Level(len(levelToStr)) {
+		return levelToStr[self]
 	}
-
-	return levelToStr[uint8(self)]
+	return "Level(" + strconv.Itoa(int(self)) + ")"
 }
 
 type ErrorCode uint8
@@ -355,16 +355,33 @@ type ErrorCode uint8
 const NoErrorCode = 0
 
 func stacktrace() []string {
-	ret := make([]string, 0, 2)
-	for skip := 2; true; skip++ {
-		_, file, line, ok := runtime.Caller(skip)
-		if ok == false {
+	pc := make([]uintptr, 16)
+	n := runtime.Callers(2, pc)
+	for n == len(pc) {
+		pc = make([]uintptr, len(pc)*2)
+		n = runtime.Callers(2, pc)
+	}
+	if n == 0 {
+		// No PCs available. This can happen if the first argument to
+		// runtime.Callers is large.
+		//
+		// Return now to avoid processing the zero Frame that would
+		// otherwise be returned by frames.Next below.
+		return nil
+	}
+	pc = pc[:n]
+	ret := make([]string, 0, n)
+	frames := runtime.CallersFrames(pc)
+	for {
+		// TODO: stop at runtime?
+		frame, more := frames.Next()
+		if frame.File != "" {
+			ret = append(ret, "at "+stripDirectories(frame.File, 2)+strconv.Itoa(frame.Line))
+		}
+		if !more {
 			break
 		}
-
-		ret = append(ret, fmt.Sprintf("at %s:%d", stripDirectories(file, 2), line))
 	}
-
 	return ret
 }
 
